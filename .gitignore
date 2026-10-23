@@ -1,0 +1,49 @@
+# =========================
+# ESP-IDF
+# =========================
+
+# Thu muc build sinh ra khi chay idf.py build
+**/build/
+
+# Cau hinh may cuc bo cua ESP-IDF
+**/sdkconfig
+**/sdkconfig.old
+
+# Component duoc quan ly/tai tu ben ngoai
+**/managed_components/
+**/.embuild/
+
+# =========================
+# Arduino IDE / PlatformIO
+# =========================
+
+# File build va firmware sinh ra
+*.bin
+*.elf
+*.hex
+*.map
+*.eep
+*.lst
+*.o
+*.a
+*.ino.cpp
+
+# Thu muc build tam
+**/arduino_build*/
+**/.pio/
+
+# =========================
+# IDE va he dieu hanh
+# =========================
+
+**/.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# File tam / backup
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
