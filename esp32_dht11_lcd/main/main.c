@@ -193,11 +193,17 @@ static esp_err_t lcd_init(const lcd_i2c_t *lcd)
 
     // Trinh tu khoi tao HD44780 4-bit.
     ESP_ERROR_CHECK(lcd_write_4_bits(lcd, 0x30));
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Sau lan thu nhat, HD44780 can toi thieu khoang 4.1 ms.
+    esp_rom_delay_us(4500);
+
     ESP_ERROR_CHECK(lcd_write_4_bits(lcd, 0x30));
-    esp_rom_delay_us(150);
+    // Sau lan thu hai cung can cho khoang 4.1 ms truoc khi thu lan ba.
+    esp_rom_delay_us(4500);
+
     ESP_ERROR_CHECK(lcd_write_4_bits(lcd, 0x30));
+    // Cho mot khoang ngan sau lan thu ba truoc khi chuyen sang 4-bit.
     esp_rom_delay_us(150);
+
     ESP_ERROR_CHECK(lcd_write_4_bits(lcd, 0x20));
     esp_rom_delay_us(150);
 

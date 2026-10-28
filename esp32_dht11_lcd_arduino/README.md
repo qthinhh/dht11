@@ -23,6 +23,10 @@ Neu DHT11 khong co san dien tro, them dien tro keo len 4.7 kOhm--10 kOhm tu DATA
 
 Code mac dinh dia chi LCD la `0x27`. Neu LCD khong hien thi, thu doi thanh `0x3F` trong file `.ino`.
 
+## Xu ly loc gia tri
+
+Chuong trinh loc theo thu tu: kiem tra doc hop le, kiem tra mien gia tri, median 3 mau, xac nhan thay doi lon qua 2 lan doc lien tiep va EMA. He so EMA la `0.30` cho nhiet do va `0.20` cho do am. Neu doc loi, gia tri cu duoc giu toi da 10 giay va hien thi trang thai `STALE`.
+
 ESP32 khong chiu muc logic 5 V. Neu module PCF8574 duoc cap 5 V va co pull-up SDA/SCL len 5 V, can dung mach chuyen muc logic hai chieu hoac dam bao pull-up I2C chi len 3V3.
 
 ## Nap chuong trinh
