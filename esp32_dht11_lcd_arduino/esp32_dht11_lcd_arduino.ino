@@ -68,16 +68,33 @@ uint32_t consecutiveReadErrors = 0;
 // Hien thi mot dong va xoa cac ky tu thua cua lan hien thi truoc.
 void printLine(uint8_t row, const char *text)
 {
-  lcd.setCursor(0, row);
+  if(row == 0 || row == 1)
+  {
+    lcd.setCursor(0, row);
 
-  size_t length = text != nullptr ? strlen(text) : 0;
-  for (uint8_t column = 0; column < LCD_COLUMNS; column++) {
-    if (column < length) {
-      lcd.print(text[column]);
-    } else {
-      lcd.print(' ');
+    size_t length = text != nullptr ? strlen(text) : 0;
+    for (uint8_t column = 0; column < LCD_COLUMNS; column++) {
+      if (column < length) {
+        lcd.print(text[column]);
+      } else {
+        lcd.print(' ');
+      }
     }
   }
+  else
+  {
+    lcd.setCursor(-4, row);
+
+    size_t length = text != nullptr ? strlen(text) : 0;
+    for (uint8_t column = 0; column < LCD_COLUMNS; column++) {
+      if (column < length) {
+        lcd.print(text[column]);
+      } else {
+        lcd.print(' ');
+      }
+    }
+  }
+
 }
 
 void showMeasurement(float temperature,
