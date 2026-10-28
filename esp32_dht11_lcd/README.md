@@ -2,6 +2,8 @@
 
 Vi du nay doc DHT11 va hien thi nhiet do/do am tren LCD 20x4 thong qua module I2C PCF8574.
 
+Code su dung I2C master driver moi (`driver/i2c_master.h`), phu hop voi ESP-IDF 6.x.
+
 ## Ket noi
 
 | Thiet bi | Chan | ESP32 DevKit 30 chan |

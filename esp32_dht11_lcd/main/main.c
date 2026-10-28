@@ -1,9 +1,10 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -15,11 +16,24 @@
 
 #define DHT11_GPIO              GPIO_NUM_4
 
-#define I2C_PORT                I2C_NUM_0
+#define I2C_PORT                I2C_PORT_NUM_0
 #define I2C_SDA_GPIO            GPIO_NUM_21
 #define I2C_SCL_GPIO            GPIO_NUM_22
 #define I2C_FREQ_HZ             100000
 #define LCD_I2C_ADDRESS         0x27    // Thu 0x3F neu module cua ban dung dia chi nay
+
+/* ======================== Loc gia tri DHT11 ======================== */
+
+#define DHT11_FILTER_WINDOW             3
+#define DHT11_MIN_TEMPERATURE_C         0
+#define DHT11_MAX_TEMPERATURE_C         50
+#define DHT11_MIN_HUMIDITY_PERCENT      0
+#define DHT11_MAX_HUMIDITY_PERCENT      100
+#define DHT11_MAX_TEMPERATURE_STEP_C    3
+#define DHT11_MAX_HUMIDITY_STEP_PERCENT 10
+#define DHT11_EMA_ALPHA_TEMPERATURE    0.30f
+#define DHT11_EMA_ALPHA_HUMIDITY       0.20f
+#define DHT11_STALE_TIMEOUT_US          10000000LL
 
 static const char *TAG = "DHT11_LCD";
 
@@ -33,27 +47,69 @@ static const char *TAG = "DHT11_LCD";
 #define LCD_BACKLIGHT           0x08
 
 typedef struct {
-    i2c_port_t port;
-    uint8_t address;
+    i2c_master_dev_handle_t device;
     bool backlight;
 } lcd_i2c_t;
 
+typedef enum {
+    DHT11_FILTER_ACCEPTED,
+    DHT11_FILTER_REJECTED_RANGE,
+    DHT11_FILTER_REJECTED_SPIKE,
+} dht11_filter_result_t;
+
+typedef struct {
+    int temperature_history[DHT11_FILTER_WINDOW];
+    int humidity_history[DHT11_FILTER_WINDOW];
+    uint8_t history_count;
+    uint8_t history_next;
+
+    bool initialized;
+    bool pending_large_change;
+    int last_accepted_temperature;
+    int last_accepted_humidity;
+
+    float filtered_temperature;
+    float filtered_humidity;
+    int64_t last_output_us;
+} dht11_filter_t;
+
 /* ======================== I2C ======================== */
 
-static esp_err_t i2c_master_init(void)
+static esp_err_t i2c_master_init(i2c_master_bus_handle_t *bus_handle,
+                                 i2c_master_dev_handle_t *device_handle)
 {
-    i2c_config_t config = {
-        .mode = I2C_MODE_MASTER,
+    if (bus_handle == NULL || device_handle == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_PORT,
         .sda_io_num = I2C_SDA_GPIO,
         .scl_io_num = I2C_SCL_GPIO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-        .clk_flags = 0,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
 
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &config));
-    return i2c_driver_install(I2C_PORT, config.mode, 0, 0, 0);
+    esp_err_t result = i2c_new_master_bus(&bus_config, bus_handle);
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = LCD_I2C_ADDRESS,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+
+    result = i2c_master_bus_add_device(
+        *bus_handle, &device_config, device_handle);
+    if (result != ESP_OK) {
+        i2c_del_master_bus(*bus_handle);
+        *bus_handle = NULL;
+    }
+
+    return result;
 }
 
 /* ======================== LCD 20x4 ======================== */
@@ -62,20 +118,8 @@ static esp_err_t lcd_expander_write(const lcd_i2c_t *lcd, uint8_t value)
 {
     uint8_t output = value | (lcd->backlight ? LCD_BACKLIGHT : 0);
 
-    i2c_cmd_handle_t command = i2c_cmd_link_create();
-    if (command == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    i2c_master_start(command);
-    i2c_master_write_byte(command, (lcd->address << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(command, output, true);
-    i2c_master_stop(command);
-
-    esp_err_t result = i2c_master_cmd_begin(
-        lcd->port, command, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(command);
-    return result;
+    // The device handle already contains the 7-bit LCD address.
+    return i2c_master_transmit(lcd->device, &output, 1, 100);
 }
 
 static esp_err_t lcd_write_4_bits(const lcd_i2c_t *lcd, uint8_t value)
@@ -128,25 +172,18 @@ static esp_err_t lcd_set_cursor(const lcd_i2c_t *lcd, uint8_t row, uint8_t colum
     return lcd_command(lcd, 0x80 | (row_offsets[row] + column));
 }
 
-static esp_err_t lcd_print_line(const lcd_i2c_t *lcd, uint8_t row, const char *text)
+static void lcd_print_line(const lcd_i2c_t *lcd, uint8_t row, const char *text)
 {
-    esp_err_t result = lcd_set_cursor(lcd, row, 0);
-    if (result != ESP_OK) {
-        return result;
-    }
+    size_t length = text != NULL ? strlen(text) : 0;
 
-    // Ghi du 20 ky tu de xoa ky tu thua cua lan hien thi truoc.
+    ESP_ERROR_CHECK(lcd_set_cursor(lcd, row, 0));
+
     for (uint8_t column = 0; column < 20; ++column) {
-        uint8_t character = (text != NULL && text[column] != '\0')
+        uint8_t character = (column < length)
                                 ? (uint8_t)text[column]
                                 : (uint8_t)' ';
-        result = lcd_data(lcd, character);
-        if (result != ESP_OK) {
-            return result;
-        }
+        ESP_ERROR_CHECK(lcd_data(lcd, character));
     }
-
-    return ESP_OK;
 }
 
 static esp_err_t lcd_init(const lcd_i2c_t *lcd)
@@ -172,6 +209,43 @@ static esp_err_t lcd_init(const lcd_i2c_t *lcd)
     ESP_ERROR_CHECK(lcd_command(lcd, 0x0C)); // Bat hien thi, tat con tro
 
     return ESP_OK;
+}
+
+static int fixed_point_tenths(float value)
+{
+    return value >= 0.0f
+             ? (int)(value * 10.0f + 0.5f)
+             : (int)(value * 10.0f - 0.5f);
+}
+
+static void lcd_show_measurement(const lcd_i2c_t *lcd,
+                                 float temperature,
+                                 float humidity,
+                                 const char *status,
+                                 const char *detail)
+{
+    char line[21];
+    int temperature_tenths = fixed_point_tenths(temperature);
+    int humidity_tenths = fixed_point_tenths(humidity);
+
+    snprintf(line, sizeof(line), "Nhiet do: %3d.%d C",
+             temperature_tenths / 10, temperature_tenths % 10);
+    lcd_print_line(lcd, 0, line);
+
+    snprintf(line, sizeof(line), "Do am   : %3d.%d %%",
+             humidity_tenths / 10, humidity_tenths % 10);
+    lcd_print_line(lcd, 1, line);
+
+    lcd_print_line(lcd, 2, status);
+    lcd_print_line(lcd, 3, detail);
+}
+
+static void lcd_show_read_error(const lcd_i2c_t *lcd)
+{
+    lcd_print_line(lcd, 0, "DHT11: LOI DOC");
+    lcd_print_line(lcd, 1, "Kiem tra DATA/VCC");
+    lcd_print_line(lcd, 2, "Cho lan doc tiep");
+    lcd_print_line(lcd, 3, "");
 }
 
 /* ======================== DHT11 ======================== */
@@ -254,24 +328,132 @@ static esp_err_t dht11_read(int *temperature_c, int *humidity_percent)
     return ESP_OK;
 }
 
+static int absolute_difference(int first, int second)
+{
+    int difference = first - second;
+    return difference < 0 ? -difference : difference;
+}
+
+static int median_int(const int *values, uint8_t count)
+{
+    int sorted[DHT11_FILTER_WINDOW] = {0};
+
+    for (uint8_t i = 0; i < count; ++i) {
+        sorted[i] = values[i];
+    }
+
+    for (uint8_t i = 0; i < count; ++i) {
+        for (uint8_t j = i + 1; j < count; ++j) {
+            if (sorted[j] < sorted[i]) {
+                int temporary = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = temporary;
+            }
+        }
+    }
+
+    return sorted[count / 2];
+}
+
+static dht11_filter_result_t dht11_filter_update(
+    dht11_filter_t *filter, int temperature, int humidity)
+{
+    if (temperature < DHT11_MIN_TEMPERATURE_C ||
+        temperature > DHT11_MAX_TEMPERATURE_C ||
+        humidity < DHT11_MIN_HUMIDITY_PERCENT ||
+        humidity > DHT11_MAX_HUMIDITY_PERCENT) {
+        return DHT11_FILTER_REJECTED_RANGE;
+    }
+
+    filter->temperature_history[filter->history_next] = temperature;
+    filter->humidity_history[filter->history_next] = humidity;
+    filter->history_next =
+        (filter->history_next + 1) % DHT11_FILTER_WINDOW;
+
+    if (filter->history_count < DHT11_FILTER_WINDOW) {
+        ++filter->history_count;
+    }
+
+    int median_temperature = median_int(
+        filter->temperature_history, filter->history_count);
+    int median_humidity = median_int(
+        filter->humidity_history, filter->history_count);
+
+    if (!filter->initialized) {
+        filter->filtered_temperature = (float)median_temperature;
+        filter->filtered_humidity = (float)median_humidity;
+        filter->last_accepted_temperature = median_temperature;
+        filter->last_accepted_humidity = median_humidity;
+        filter->last_output_us = esp_timer_get_time();
+        filter->initialized = true;
+        return DHT11_FILTER_ACCEPTED;
+    }
+
+    bool large_change =
+        absolute_difference(median_temperature,
+                            filter->last_accepted_temperature) >
+            DHT11_MAX_TEMPERATURE_STEP_C ||
+        absolute_difference(median_humidity,
+                            filter->last_accepted_humidity) >
+            DHT11_MAX_HUMIDITY_STEP_PERCENT;
+
+    if (large_change) {
+        // Require two consecutive samples before accepting a sudden jump.
+        if (!filter->pending_large_change) {
+            filter->pending_large_change = true;
+            return DHT11_FILTER_REJECTED_SPIKE;
+        }
+        filter->pending_large_change = false;
+    } else {
+        filter->pending_large_change = false;
+    }
+
+    filter->filtered_temperature =
+        DHT11_EMA_ALPHA_TEMPERATURE * (float)median_temperature +
+        (1.0f - DHT11_EMA_ALPHA_TEMPERATURE) *
+            filter->filtered_temperature;
+    filter->filtered_humidity =
+        DHT11_EMA_ALPHA_HUMIDITY * (float)median_humidity +
+        (1.0f - DHT11_EMA_ALPHA_HUMIDITY) *
+            filter->filtered_humidity;
+    filter->last_accepted_temperature = median_temperature;
+    filter->last_accepted_humidity = median_humidity;
+    filter->last_output_us = esp_timer_get_time();
+
+    return DHT11_FILTER_ACCEPTED;
+}
+
+static bool dht11_filter_has_fresh_output(const dht11_filter_t *filter)
+{
+    return filter->initialized &&
+           (esp_timer_get_time() - filter->last_output_us) <=
+               DHT11_STALE_TIMEOUT_US;
+}
+
 /* ======================== Ung dung ======================== */
 
 void app_main(void)
 {
+    i2c_master_bus_handle_t bus_handle;
+    i2c_master_dev_handle_t device_handle;
+
+    ESP_ERROR_CHECK(i2c_master_init(&bus_handle, &device_handle));
+
     const lcd_i2c_t lcd = {
-        .port = I2C_PORT,
-        .address = LCD_I2C_ADDRESS,
+        .device = device_handle,
         .backlight = true,
     };
 
-    ESP_ERROR_CHECK(i2c_master_init());
     ESP_ERROR_CHECK(dht11_gpio_init());
     ESP_ERROR_CHECK(lcd_init(&lcd));
 
-    ESP_ERROR_CHECK(lcd_print_line(&lcd, 0, "ESP32 DHT11 LCD"));
-    ESP_ERROR_CHECK(lcd_print_line(&lcd, 1, "Dang khoi dong..."));
-    ESP_ERROR_CHECK(lcd_print_line(&lcd, 2, ""));
-    ESP_ERROR_CHECK(lcd_print_line(&lcd, 3, ""));
+    lcd_print_line(&lcd, 0, "ESP32 DHT11 LCD");
+    lcd_print_line(&lcd, 1, "Dang khoi dong...");
+    lcd_print_line(&lcd, 2, "");
+    lcd_print_line(&lcd, 3, "");
+
+    dht11_filter_t filter = {0};
+    uint32_t consecutive_read_errors = 0;
 
     while (true) {
         int temperature_c;
@@ -279,28 +461,70 @@ void app_main(void)
         esp_err_t result = dht11_read(&temperature_c, &humidity_percent);
 
         if (result == ESP_OK) {
-            char line[21];
+            consecutive_read_errors = 0;
 
-            ESP_LOGI(TAG, "Nhiet do: %d C, do am: %d%%",
-                     temperature_c, humidity_percent);
+            dht11_filter_result_t filter_result = dht11_filter_update(
+                &filter, temperature_c, humidity_percent);
 
-            snprintf(line, sizeof(line), "Nhiet do: %2d C", temperature_c);
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 0, line));
+            if (filter_result == DHT11_FILTER_ACCEPTED) {
+                int temperature_tenths = fixed_point_tenths(
+                    filter.filtered_temperature);
+                int humidity_tenths = fixed_point_tenths(
+                    filter.filtered_humidity);
 
-            snprintf(line, sizeof(line), "Do am   : %2d %%", humidity_percent);
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 1, line));
+                ESP_LOGI(TAG,
+                         "Raw: %d C, %d%% | Loc: %d.%d C, %d.%d%%",
+                         temperature_c, humidity_percent,
+                         temperature_tenths / 10, temperature_tenths % 10,
+                         humidity_tenths / 10, humidity_tenths % 10);
 
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 2, "Trang thai: OK"));
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 3, "Cap nhat moi 2 giay"));
+                lcd_show_measurement(&lcd,
+                                     filter.filtered_temperature,
+                                     filter.filtered_humidity,
+                                     "Trang thai: OK",
+                                     "Median3 + EMA");
+            } else if (dht11_filter_has_fresh_output(&filter)) {
+                const char *detail = filter_result ==
+                                             DHT11_FILTER_REJECTED_SPIKE
+                                         ? "Cho mau lap lai"
+                                         : "Mau vuot gioi han";
+
+                ESP_LOGW(TAG, "Bo qua mau DHT11 do gia tri bat thuong: %d C, %d%%",
+                         temperature_c, humidity_percent);
+
+                lcd_show_measurement(&lcd,
+                                     filter.filtered_temperature,
+                                     filter.filtered_humidity,
+                                     "Trang thai: LOC",
+                                     detail);
+            } else {
+                ESP_LOGW(TAG, "Chua co mau DHT11 hop le sau loc: %d C, %d%%",
+                         temperature_c, humidity_percent);
+                lcd_show_read_error(&lcd);
+            }
         } else {
+            if (consecutive_read_errors < UINT32_MAX) {
+                ++consecutive_read_errors;
+            }
+
             ESP_LOGW(TAG, "Khong doc duoc DHT11: %s", esp_err_to_name(result));
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 0, "DHT11: LOI DOC"));
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 1, "Kiem tra DATA/VCC"));
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 2, "Thu lai sau 2 giay"));
-            ESP_ERROR_CHECK(lcd_print_line(&lcd, 3, ""));
+
+            if (dht11_filter_has_fresh_output(&filter)) {
+                char detail[21];
+                snprintf(detail, sizeof(detail), "Loi doc: %2lu lan",
+                         (unsigned long)consecutive_read_errors);
+
+                lcd_show_measurement(&lcd,
+                                     filter.filtered_temperature,
+                                     filter.filtered_humidity,
+                                     "Trang thai: STALE",
+                                     detail);
+            } else {
+                lcd_show_read_error(&lcd);
+            }
         }
 
-        // DHT11 khong nen doc nhanh hon khoang 1 giay.
+        // DHT11 can khoang cach doc toi thieu 2 giay.
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
