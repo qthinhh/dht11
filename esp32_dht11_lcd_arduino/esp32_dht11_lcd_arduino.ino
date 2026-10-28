@@ -104,10 +104,10 @@ void showMeasurement(float temperature,
 {
   char line[21];
 
-  snprintf(line, sizeof(line), "Nhiet do: %5.1f C", temperature);
+  snprintf(line, sizeof(line), "Nhiet do: %4.1f C", temperature);
   printLine(0, line);
 
-  snprintf(line, sizeof(line), "Do am   : %5.1f %%", humidity);
+  snprintf(line, sizeof(line), "Do am   : %4.1f %%", humidity);
   printLine(1, line);
 
   printLine(2, status);
