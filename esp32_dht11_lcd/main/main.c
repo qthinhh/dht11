@@ -24,6 +24,16 @@
 
 /* ======================== Loc gia tri DHT11 ======================== */
 
+/*
+ * Cac lop xu ly nhieu:
+ * 1. Kiem tra khung 40 bit, timeout va checksum khi doc DHT11.
+ * 2. Loai mau nam ngoai mien nhiet do/do am cho phep.
+ * 3. Median 3 mau de giam anh huong cua mot mau dot bien.
+ * 4. Yeu cau hai mau lien tiep xac nhan buoc nhay lon.
+ * 5. EMA de lam muot gia tri truoc khi hien thi.
+ * 6. Giu gia tri hop le cu trong thoi gian ngan neu doc loi (STALE).
+ */
+
 #define DHT11_FILTER_WINDOW             3
 #define DHT11_MIN_TEMPERATURE_C         0
 #define DHT11_MAX_TEMPERATURE_C         50
@@ -288,6 +298,7 @@ static bool dht11_wait_level(int level, uint32_t timeout_us, uint32_t *duration_
 
 static esp_err_t dht11_read(int *temperature_c, int *humidity_percent)
 {
+    // Lop 1: Doc 40 bit, timeout va checksum truoc khi dua mau vao bo loc.
     uint8_t data[5] = {0};
     uint32_t high_time_us;
 
@@ -364,6 +375,7 @@ static int median_int(const int *values, uint8_t count)
 static dht11_filter_result_t dht11_filter_update(
     dht11_filter_t *filter, int temperature, int humidity)
 {
+    // Lop 2: Loai mau nam ngoai mien gia tri hop ly.
     if (temperature < DHT11_MIN_TEMPERATURE_C ||
         temperature > DHT11_MAX_TEMPERATURE_C ||
         humidity < DHT11_MIN_HUMIDITY_PERCENT ||
@@ -371,6 +383,7 @@ static dht11_filter_result_t dht11_filter_update(
         return DHT11_FILTER_REJECTED_RANGE;
     }
 
+    // Lop 3: Cap nhat cua so va tinh Median 3 mau.
     filter->temperature_history[filter->history_next] = temperature;
     filter->humidity_history[filter->history_next] = humidity;
     filter->history_next =
@@ -395,6 +408,7 @@ static dht11_filter_result_t dht11_filter_update(
         return DHT11_FILTER_ACCEPTED;
     }
 
+    // Lop 4: Xac nhan buoc nhay lon qua hai lan doc lien tiep.
     bool large_change =
         absolute_difference(median_temperature,
                             filter->last_accepted_temperature) >
@@ -414,6 +428,7 @@ static dht11_filter_result_t dht11_filter_update(
         filter->pending_large_change = false;
     }
 
+    // Lop 5: Lam muot gia tri median bang bo loc EMA.
     filter->filtered_temperature =
         DHT11_EMA_ALPHA_TEMPERATURE * (float)median_temperature +
         (1.0f - DHT11_EMA_ALPHA_TEMPERATURE) *
@@ -515,6 +530,7 @@ void app_main(void)
 
             ESP_LOGW(TAG, "Khong doc duoc DHT11: %s", esp_err_to_name(result));
 
+            // Lop 6: Neu doc loi, tam giu gia tri loc hop le gan nhat.
             if (dht11_filter_has_fresh_output(&filter)) {
                 char detail[21];
                 snprintf(detail, sizeof(detail), "Loi doc: %2lu lan",

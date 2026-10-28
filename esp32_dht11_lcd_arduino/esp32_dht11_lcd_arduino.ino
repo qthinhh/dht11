@@ -16,6 +16,16 @@
 #define LCD_ROWS            4
 
 // ======================== Loc gia tri DHT11 ========================
+
+/*
+ * Cac lop xu ly nhieu:
+ * 1. Thu vien DHT doc khung va kiem tra du lieu/checksum.
+ * 2. Loai mau nam ngoai mien nhiet do/do am cho phep.
+ * 3. Median 3 mau de giam anh huong cua mot mau dot bien.
+ * 4. Yeu cau hai mau lien tiep xac nhan buoc nhay lon.
+ * 5. EMA de lam muot gia tri truoc khi hien thi.
+ * 6. Giu gia tri hop le cu trong thoi gian ngan neu doc loi (STALE).
+ */
 #define DHT11_FILTER_WINDOW             3
 #define DHT11_MIN_TEMPERATURE_C         0.0f
 #define DHT11_MAX_TEMPERATURE_C         50.0f
@@ -118,6 +128,7 @@ float medianOfSamples(const float *values, uint8_t count)
 
 Dht11FilterResult updateFilter(float temperature, float humidity)
 {
+  // Lop 2: Loai mau nam ngoai mien gia tri hop ly.
   if (temperature < DHT11_MIN_TEMPERATURE_C ||
       temperature > DHT11_MAX_TEMPERATURE_C ||
       humidity < DHT11_MIN_HUMIDITY_PERCENT ||
@@ -125,6 +136,7 @@ Dht11FilterResult updateFilter(float temperature, float humidity)
     return DHT11_FILTER_REJECTED_RANGE;
   }
 
+  // Lop 3: Cap nhat cua so va tinh Median 3 mau.
   dhtFilter.temperatureHistory[dhtFilter.historyNext] = temperature;
   dhtFilter.humidityHistory[dhtFilter.historyNext] = humidity;
   dhtFilter.historyNext =
@@ -149,6 +161,7 @@ Dht11FilterResult updateFilter(float temperature, float humidity)
     return DHT11_FILTER_ACCEPTED;
   }
 
+  // Lop 4: Xac nhan buoc nhay lon qua hai lan doc lien tiep.
   bool largeChange =
       fabsf(medianTemperature - dhtFilter.lastAcceptedTemperature) >
           DHT11_MAX_TEMPERATURE_STEP_C ||
@@ -166,6 +179,7 @@ Dht11FilterResult updateFilter(float temperature, float humidity)
     dhtFilter.pendingLargeChange = false;
   }
 
+  // Lop 5: Lam muot gia tri median bang bo loc EMA.
   dhtFilter.filteredTemperature =
       DHT11_EMA_ALPHA_TEMPERATURE * medianTemperature +
       (1.0f - DHT11_EMA_ALPHA_TEMPERATURE) *
@@ -212,6 +226,7 @@ void setup()
 void loop()
 {
   // DHT11 can khoang cach doc toi thieu 2 giay.
+  // Lop 1: Thu vien DHT doc khung va kiem tra checksum truoc khi loc.
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
 
@@ -222,6 +237,7 @@ void loop()
 
     Serial.println("Khong doc duoc DHT11");
 
+    // Lop 6: Neu doc loi, tam giu gia tri loc hop le gan nhat.
     if (hasFreshFilteredOutput()) {
       char detail[21];
       snprintf(detail, sizeof(detail), "Loi doc: %2lu lan",
