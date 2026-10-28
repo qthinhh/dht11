@@ -1,7 +1,9 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <math.h>
 #include <string.h>
+#include <stdint.h>
 
 // ======================== Cau hinh chan ========================
 #define DHT_PIN             4
@@ -13,15 +15,52 @@
 #define LCD_COLUMNS         20
 #define LCD_ROWS            4
 
+// ======================== Loc gia tri DHT11 ========================
+#define DHT11_FILTER_WINDOW             3
+#define DHT11_MIN_TEMPERATURE_C         0.0f
+#define DHT11_MAX_TEMPERATURE_C         50.0f
+#define DHT11_MIN_HUMIDITY_PERCENT      0.0f
+#define DHT11_MAX_HUMIDITY_PERCENT      100.0f
+#define DHT11_MAX_TEMPERATURE_STEP_C    3.0f
+#define DHT11_MAX_HUMIDITY_STEP_PERCENT 10.0f
+#define DHT11_EMA_ALPHA_TEMPERATURE    0.30f
+#define DHT11_EMA_ALPHA_HUMIDITY       0.20f
+#define DHT11_STALE_TIMEOUT_MS          10000UL
+
 DHT dht(DHT_PIN, DHT_TYPE);
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+enum Dht11FilterResult {
+  DHT11_FILTER_ACCEPTED,
+  DHT11_FILTER_REJECTED_RANGE,
+  DHT11_FILTER_REJECTED_SPIKE
+};
+
+struct Dht11Filter {
+  float temperatureHistory[DHT11_FILTER_WINDOW] = {0.0f};
+  float humidityHistory[DHT11_FILTER_WINDOW] = {0.0f};
+  uint8_t historyCount = 0;
+  uint8_t historyNext = 0;
+
+  bool initialized = false;
+  bool pendingLargeChange = false;
+  float lastAcceptedTemperature = 0.0f;
+  float lastAcceptedHumidity = 0.0f;
+
+  float filteredTemperature = 0.0f;
+  float filteredHumidity = 0.0f;
+  uint32_t lastOutputMs = 0;
+};
+
+Dht11Filter dhtFilter;
+uint32_t consecutiveReadErrors = 0;
 
 // Hien thi mot dong va xoa cac ky tu thua cua lan hien thi truoc.
 void printLine(uint8_t row, const char *text)
 {
   lcd.setCursor(0, row);
 
-  size_t length = strlen(text);
+  size_t length = text != nullptr ? strlen(text) : 0;
   for (uint8_t column = 0; column < LCD_COLUMNS; column++) {
     if (column < length) {
       lcd.print(text[column]);
@@ -29,6 +68,124 @@ void printLine(uint8_t row, const char *text)
       lcd.print(' ');
     }
   }
+}
+
+void showMeasurement(float temperature,
+                    float humidity,
+                    const char *status,
+                    const char *detail)
+{
+  char line[21];
+
+  snprintf(line, sizeof(line), "Nhiet do: %5.1f C", temperature);
+  printLine(0, line);
+
+  snprintf(line, sizeof(line), "Do am   : %5.1f %%", humidity);
+  printLine(1, line);
+
+  printLine(2, status);
+  printLine(3, detail);
+}
+
+void showReadError()
+{
+  printLine(0, "DHT11: LOI DOC");
+  printLine(1, "Kiem tra DATA/VCC");
+  printLine(2, "Cho lan doc tiep");
+  printLine(3, "");
+}
+
+float medianOfSamples(const float *values, uint8_t count)
+{
+  float sorted[DHT11_FILTER_WINDOW] = {0.0f};
+
+  for (uint8_t i = 0; i < count; ++i) {
+    sorted[i] = values[i];
+  }
+
+  for (uint8_t i = 0; i < count; ++i) {
+    for (uint8_t j = i + 1; j < count; ++j) {
+      if (sorted[j] < sorted[i]) {
+        float temporary = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = temporary;
+      }
+    }
+  }
+
+  return sorted[count / 2];
+}
+
+Dht11FilterResult updateFilter(float temperature, float humidity)
+{
+  if (temperature < DHT11_MIN_TEMPERATURE_C ||
+      temperature > DHT11_MAX_TEMPERATURE_C ||
+      humidity < DHT11_MIN_HUMIDITY_PERCENT ||
+      humidity > DHT11_MAX_HUMIDITY_PERCENT) {
+    return DHT11_FILTER_REJECTED_RANGE;
+  }
+
+  dhtFilter.temperatureHistory[dhtFilter.historyNext] = temperature;
+  dhtFilter.humidityHistory[dhtFilter.historyNext] = humidity;
+  dhtFilter.historyNext =
+      (dhtFilter.historyNext + 1) % DHT11_FILTER_WINDOW;
+
+  if (dhtFilter.historyCount < DHT11_FILTER_WINDOW) {
+    ++dhtFilter.historyCount;
+  }
+
+  float medianTemperature = medianOfSamples(
+      dhtFilter.temperatureHistory, dhtFilter.historyCount);
+  float medianHumidity = medianOfSamples(
+      dhtFilter.humidityHistory, dhtFilter.historyCount);
+
+  if (!dhtFilter.initialized) {
+    dhtFilter.filteredTemperature = medianTemperature;
+    dhtFilter.filteredHumidity = medianHumidity;
+    dhtFilter.lastAcceptedTemperature = medianTemperature;
+    dhtFilter.lastAcceptedHumidity = medianHumidity;
+    dhtFilter.lastOutputMs = millis();
+    dhtFilter.initialized = true;
+    return DHT11_FILTER_ACCEPTED;
+  }
+
+  bool largeChange =
+      fabsf(medianTemperature - dhtFilter.lastAcceptedTemperature) >
+          DHT11_MAX_TEMPERATURE_STEP_C ||
+      fabsf(medianHumidity - dhtFilter.lastAcceptedHumidity) >
+          DHT11_MAX_HUMIDITY_STEP_PERCENT;
+
+  if (largeChange) {
+    // Can hai mau lien tiep cung xac nhan truoc khi chap nhan buoc nhay lon.
+    if (!dhtFilter.pendingLargeChange) {
+      dhtFilter.pendingLargeChange = true;
+      return DHT11_FILTER_REJECTED_SPIKE;
+    }
+    dhtFilter.pendingLargeChange = false;
+  } else {
+    dhtFilter.pendingLargeChange = false;
+  }
+
+  dhtFilter.filteredTemperature =
+      DHT11_EMA_ALPHA_TEMPERATURE * medianTemperature +
+      (1.0f - DHT11_EMA_ALPHA_TEMPERATURE) *
+          dhtFilter.filteredTemperature;
+  dhtFilter.filteredHumidity =
+      DHT11_EMA_ALPHA_HUMIDITY * medianHumidity +
+      (1.0f - DHT11_EMA_ALPHA_HUMIDITY) *
+          dhtFilter.filteredHumidity;
+  dhtFilter.lastAcceptedTemperature = medianTemperature;
+  dhtFilter.lastAcceptedHumidity = medianHumidity;
+  dhtFilter.lastOutputMs = millis();
+
+  return DHT11_FILTER_ACCEPTED;
+}
+
+bool hasFreshFilteredOutput()
+{
+  return dhtFilter.initialized &&
+         (uint32_t)(millis() - dhtFilter.lastOutputMs) <=
+             DHT11_STALE_TIMEOUT_MS;
 }
 
 void setup()
@@ -54,34 +211,68 @@ void setup()
 
 void loop()
 {
-  // DHT11 khong nen doc nhanh hon khoang 1 giay.
+  // DHT11 can khoang cach doc toi thieu 2 giay.
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
 
   if (isnan(humidity) || isnan(temperature)) {
+    if (consecutiveReadErrors < UINT32_MAX) {
+      ++consecutiveReadErrors;
+    }
+
     Serial.println("Khong doc duoc DHT11");
 
-    printLine(0, "DHT11: LOI DOC");
-    printLine(1, "Kiem tra DATA/VCC");
-    printLine(2, "Thu lai sau 2 giay");
-    printLine(3, "");
+    if (hasFreshFilteredOutput()) {
+      char detail[21];
+      snprintf(detail, sizeof(detail), "Loi doc: %2lu lan",
+               (unsigned long)consecutiveReadErrors);
+
+      showMeasurement(dhtFilter.filteredTemperature,
+                      dhtFilter.filteredHumidity,
+                      "Trang thai: STALE",
+                      detail);
+    } else {
+      showReadError();
+    }
   } else {
-    char line[21];
+    consecutiveReadErrors = 0;
 
-    Serial.print("Nhiet do: ");
-    Serial.print(temperature, 1);
-    Serial.print(" C | Do am: ");
-    Serial.print(humidity, 1);
-    Serial.println(" %");
+    Dht11FilterResult filterResult = updateFilter(temperature, humidity);
 
-    snprintf(line, sizeof(line), "Nhiet do: %5.1f C", temperature);
-    printLine(0, line);
+    if (filterResult == DHT11_FILTER_ACCEPTED) {
+      Serial.print("Raw: ");
+      Serial.print(temperature, 1);
+      Serial.print(" C, ");
+      Serial.print(humidity, 1);
+      Serial.print(" % | Loc: ");
+      Serial.print(dhtFilter.filteredTemperature, 1);
+      Serial.print(" C, ");
+      Serial.print(dhtFilter.filteredHumidity, 1);
+      Serial.println(" %");
 
-    snprintf(line, sizeof(line), "Do am   : %5.1f %%", humidity);
-    printLine(1, line);
+      showMeasurement(dhtFilter.filteredTemperature,
+                      dhtFilter.filteredHumidity,
+                      "Trang thai: OK",
+                      "Median3 + EMA");
+    } else if (hasFreshFilteredOutput()) {
+      const char *detail = filterResult == DHT11_FILTER_REJECTED_SPIKE
+                               ? "Cho mau lap lai"
+                               : "Mau vuot gioi han";
 
-    printLine(2, "Trang thai: OK");
-    printLine(3, "Cap nhat moi 2 giay");
+      Serial.print("Bo qua mau bat thuong: ");
+      Serial.print(temperature, 1);
+      Serial.print(" C, ");
+      Serial.print(humidity, 1);
+      Serial.println(" %");
+
+      showMeasurement(dhtFilter.filteredTemperature,
+                      dhtFilter.filteredHumidity,
+                      "Trang thai: LOC",
+                      detail);
+    } else {
+      Serial.println("Chua co mau DHT11 hop le sau loc");
+      showReadError();
+    }
   }
 
   delay(2000);
